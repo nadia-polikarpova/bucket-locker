@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bucket_locker"
+version = "0.1.0"
+description = "A Python library that synchronizes local files with Google Cloud Storage in a concurrency-aware manner."
+readme = "README.md"
+authors = [
+  {name = "Nadia Polikarpova", email = "nadia.polikarpova@gmail.com"}
+]
+classifiers = []
+license = {text = "MIT license"}
+dependencies = ["google-cloud-storage"]
+
+[project.urls]
+
+homepage = "https://github.com/nadia-polikarpova/bucket-locker"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+packages = ["bucket_locker"]
