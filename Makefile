@@ -8,3 +8,7 @@ upload: all
 
 clean:
 	rm -rf dist/ build/ *.egg-info/
+
+test:
+	python -m pip install -e .[dev]
+	pytest

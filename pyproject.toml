@@ -22,3 +22,15 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# ---- Dev & test deps ----
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "pytest-asyncio>=0.23",
+]
+
+# (Optional) make pytest auto-detect asyncio tests
+[tool.pytest.ini_options]
+addopts = "-q"
+asyncio_mode = "auto"

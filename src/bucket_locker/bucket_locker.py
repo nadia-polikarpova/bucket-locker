@@ -20,11 +20,13 @@ class BlobNotFound(Exception):
 class Locker:
     """A class that provides concurrency-safe access to a local copy of a Google Cloud Storage bucket."""
 
-    def __init__(self, bucket_name: str, local_dir: Path):
+    def __init__(self, bucket_name: str, local_dir: Path,
+                 *, bucket=None # for testing purposes
+                 ):
         self.bucket_name = bucket_name
         self.local_dir = local_dir
         self._client = storage.Client()
-        self._bucket = self._client.bucket(bucket_name)
+        self._bucket = bucket or self._client.bucket(bucket_name)
         self._file_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
         self.logger = logging.getLogger(__name__)
         self.logger.setLevel(logging.INFO)
