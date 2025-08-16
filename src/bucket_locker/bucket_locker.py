@@ -4,6 +4,7 @@ import logging
 import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 import uuid
 import base64
 from google.cloud import storage
@@ -107,9 +108,20 @@ class Locker:
         local_path = self.local_path(blob_name)
         if local_path.exists():
             blob = self._bucket.blob(blob_name)
+            blob.reload()  # Ensure we have the latest generation info
+            local_gen = self._local_generation(blob_name) # Generation at the time of download
+
             if self._files_differ_crc32c(local_path, blob):
-                blob.upload_from_filename(local_path)
-                self._save_generation(blob_name, blob)
+                try:
+                    blob.upload_from_filename(local_path, if_generation_match=local_gen)
+                except PreconditionFailed:
+                    # Someone has modified the blob since we downloaded it despite our lock!
+                    # We're going to upload to a new unique blob name to avoid overwriting.
+                    new_blob_name = f"{blob_name}.conflict.{uuid.uuid4()}"
+                    self.logger.error(f"[{PROCESS_ID}] Blob {blob_name} was modified in an unprotected manner. Uploading to {new_blob_name} instead.")
+                    blob = self._bucket.blob(new_blob_name)
+                    blob.upload_from_filename(local_path, if_generation_match=0)  # 0 means 'create new'
+                self._save_generation(blob_name, blob) # In case of conflict, save under original name by design, because we want to re-download the blob next time
                 self.logger.info(f"[{PROCESS_ID}] Uploaded blob {blob_name} to GCS")
             else:
                 self.logger.debug(f"[{PROCESS_ID}] Blob {blob_name} is up-to-date, no upload needed")
@@ -167,22 +179,20 @@ class Locker:
 
     def _local_in_sync(self, blob_name: str) -> bool:
         """Check if the local copy of the blob is still in sync with GCS."""
-        local_path = self.local_path(blob_name)
-        meta_path = self._meta_path(blob_name)
-
-        if not local_path.exists() or not meta_path.exists():
-            # If we don't have a local copy or metadata, clearly not in sync
+        local_gen = self._local_generation(blob_name)
+        if local_gen is None:
             return False
+        blob = self._bucket.blob(blob_name)
+        blob.reload()
+        return blob.generation == local_gen
 
-        try:
-            with open(meta_path) as f:
-                local_gen = f.read().strip()
-
-            blob = self._bucket.blob(blob_name)
-            blob.reload()
-            return str(blob.generation) == local_gen
-        except Exception:
-            return False  # fail safe
+    def _local_generation(self, blob_name: str) -> Optional[int]:
+        """Get the local generation number of the blob."""
+        meta_path = self._meta_path(blob_name)
+        if not meta_path.exists():
+            return None
+        with open(meta_path) as f:
+            return int(f.read().strip())
 
     def _save_generation(self, blob_name: str, blob: storage.Blob):
         """
@@ -203,7 +213,6 @@ class Locker:
 
     def _files_differ_crc32c(self, local_path: Path, blob: storage.Blob) -> bool:
         """Check if the local file differs from the GCS blob using CRC32C."""
-        blob.reload()
         if not blob.crc32c:
             return True  # can't compare
 
