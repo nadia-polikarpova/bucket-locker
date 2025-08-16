@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from collections import defaultdict
 from contextlib import asynccontextmanager
 import logging
@@ -17,6 +18,13 @@ class BlobNotFound(Exception):
     def __init__(self, blob_name: str):
         super().__init__(f"Blob '{blob_name}' not found.")
         self.blob_name = blob_name
+
+@dataclass
+class Handle:
+    path: Path
+    _locker: "Locker"
+    _blob_name: str
+    def flush(self): self._locker._upload_blob(self._blob_name)
 
 class Locker:
     """A class that provides concurrency-safe access to a local copy of a Google Cloud Storage bucket."""
@@ -53,8 +61,9 @@ class Locker:
                 # Ensure the session file is available locally
                 self._download_blob(blob_name)
                 try:
-                    # Let the called do its thing with the local copy
-                    yield local_path
+                    # Create a Handle and yield it to the caller
+                    handle = Handle(local_path, self, blob_name)
+                    yield handle
                 finally:
                     # Once the caller is done, upload the file even if the caller raised an exception
                     # (but not if download failed!)
@@ -76,8 +85,9 @@ class Locker:
         async with self._local_lock(blob_name):
             # Ensure the session file is available locally
             self._download_blob(blob_name)
-            # Let the caller do its thing with the local copy
-            yield local_path
+            # Create a Handle and yield it to the caller
+            handle = Handle(local_path, self, blob_name)
+            yield handle
 
     def _download_blob(self, blob_name: str):
         """
@@ -109,10 +119,9 @@ class Locker:
         if local_path.exists():
             blob = self._bucket.blob(blob_name)
             blob.reload()  # Ensure we have the latest generation info
-            local_gen = self._local_generation(blob_name) # Generation at the time of download
-
             if self._files_differ_crc32c(local_path, blob):
                 try:
+                    local_gen = self._local_generation(blob_name) # Generation at the time of download
                     blob.upload_from_filename(local_path, if_generation_match=local_gen)
                 except PreconditionFailed:
                     # Someone has modified the blob since we downloaded it despite our lock!

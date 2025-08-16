@@ -20,15 +20,15 @@ async def test_conflict_writes_side_object_and_preserves_original(tmp_path):
     lk1 = Locker("dummy", tmp_path, bucket=bucket)
 
     # Start a write session and modify local to v2
-    async with lk1.owned_local_copy("data.txt") as p:
-        p.write_text("v2")
+    async with lk1.owned_local_copy("data.txt") as handle1:
+        handle1.path.write_text("v2")
         # Simulate an *unprotected* remote writer that ignored the lock
         bucket.blob("data.txt").upload_from_string("REMOTE")
 
     # After exiting, lk1 should have written to a conflict object, not the original
     # Original should remain "REMOTE"
-    async with lk1.readonly_local_copy("data.txt") as p2:
-        assert p2.read_text() == "REMOTE"
+    async with lk1.readonly_local_copy("data.txt") as handle2:
+        assert handle2.path.read_text() == "REMOTE"
 
     # Exactly one conflict object should exist; its content should be "v2"
     conflicts = _list_conflicts(bucket, "data.txt")
@@ -49,8 +49,8 @@ async def test_conflict_forces_redownload_on_next_access(tmp_path):
     lk = Locker("dummy", tmp_path, bucket=bucket)
 
     # First session - create a conflict
-    async with lk.owned_local_copy("model.bin") as p:
-        p.write_text("local-change")
+    async with lk.owned_local_copy("model.bin") as handle:
+        handle.path.write_text("local-change")
         # Cause an external write to force a conflict
         bucket.blob("model.bin").upload_from_string("remote-change")
 
@@ -59,8 +59,8 @@ async def test_conflict_forces_redownload_on_next_access(tmp_path):
     assert conflicts, "expected a conflict object to be created"
 
     # Next session should re-download the remote content
-    async with lk.readonly_local_copy("model.bin") as p:
-        assert p.read_text() == "remote-change", "Next access should download latest remote content"
+    async with lk.readonly_local_copy("model.bin") as handle:
+        assert handle.path.read_text() == "remote-change", "Next access should download latest remote content"
 
 @pytest.mark.asyncio
 async def test_no_conflict_when_remote_changes_metadata_only_crc_equal(tmp_path):
@@ -75,7 +75,7 @@ async def test_no_conflict_when_remote_changes_metadata_only_crc_equal(tmp_path)
     lk = Locker("dummy", tmp_path, bucket=bucket)
 
     # Open session (download), then re-write identical bytes remotely (new gen, same CRC)
-    async with lk.owned_local_copy("notes.txt") as p:
+    async with lk.owned_local_copy("notes.txt") as handle:
         # re-upload same bytes to bump generation but keep CRC equal
         bucket.blob("notes.txt").upload_from_string("same-bytes")
 

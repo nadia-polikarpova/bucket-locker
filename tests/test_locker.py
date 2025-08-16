@@ -1,6 +1,6 @@
 import asyncio
 import pytest
-from bucket_locker import Locker, BlobNotFound
+from bucket_locker import Locker, BlobNotFound, Handle
 from ._fakes import FakeBucket
 
 @pytest.mark.asyncio
@@ -10,8 +10,8 @@ async def test_readonly_downloads(tmp_path):
     bucket.blob("a.txt").upload_from_string("hello")
     lk = Locker("dummy", tmp_path, bucket=bucket)
 
-    async with lk.readonly_local_copy("a.txt") as p:
-        assert p.read_text() == "hello"
+    async with lk.readonly_local_copy("a.txt") as handle:
+        assert handle.path.read_text() == "hello"
 
 @pytest.mark.asyncio
 async def test_owned_uploads_when_changed(tmp_path):
@@ -19,15 +19,15 @@ async def test_owned_uploads_when_changed(tmp_path):
     bucket.blob("b.txt").upload_from_string("v1")
     lk = Locker("dummy", tmp_path, bucket=bucket)
 
-    async with lk.owned_local_copy("b.txt") as p:
-        p.write_text("v2")
+    async with lk.owned_local_copy("b.txt") as handle:
+        handle.path.write_text("v2")
 
     # After context, upload should have happened
     assert bucket.blob("b.txt").exists()
     # A second readonly copy should see v2
     lk2 = Locker("dummy", tmp_path, bucket=bucket)
-    async with lk2.readonly_local_copy("b.txt") as p2:
-        assert p2.read_text() == "v2"
+    async with lk2.readonly_local_copy("b.txt") as handle2:
+        assert handle2.path.read_text() == "v2"
 
 @pytest.mark.asyncio
 async def test_missing_blob_raises(tmp_path):
@@ -46,11 +46,11 @@ async def test_local_lock_serializes_access(tmp_path):
     order = []
 
     async def writer1():
-        async with lk.owned_local_copy("c.txt") as p:
+        async with lk.owned_local_copy("c.txt") as handle:
             started.set()
             await asyncio.sleep(0.3)
             # Append lines
-            with open(p, "a") as f:
+            with open(handle.path, "a") as f:
                 f.write("one line 1\n")
                 f.write("one line 2\n")
                 f.write("one line 3\n")
@@ -58,9 +58,9 @@ async def test_local_lock_serializes_access(tmp_path):
 
     async def writer2():
         await started.wait()
-        async with lk.owned_local_copy("c.txt") as p:
+        async with lk.owned_local_copy("c.txt") as handle:
             # Append lines
-            with open(p, "a") as f:
+            with open(handle.path, "a") as f:
                 f.write("two line 1\n")
                 f.write("two line 2\n")
                 f.write("two line 3\n")
@@ -71,8 +71,8 @@ async def test_local_lock_serializes_access(tmp_path):
     # Check the final blob content
     assert bucket.blob("c.txt").exists()
     # Read back through readonly path
-    async with lk.readonly_local_copy("c.txt") as p:
-        content = p.read_text()
+    async with lk.readonly_local_copy("c.txt") as handle:
+        content = handle.path.read_text()
         # The content should have both sets of changes in order
         expected = "x" + "one line 1\none line 2\none line 3\n" + "two line 1\ntwo line 2\ntwo line 3\n"
         assert content == expected
@@ -97,11 +97,11 @@ async def test_remote_lock_serializes_access(tmp_path):
     order = []
 
     async def writer1():
-        async with lk1.owned_local_copy("c.txt") as p:
+        async with lk1.owned_local_copy("c.txt") as handle:
             started.set()
             await asyncio.sleep(0.3)
             # Append lines
-            with open(p, "a") as f:
+            with open(handle.path, "a") as f:
                 f.write("one line 1\n")
                 f.write("one line 2\n")
                 f.write("one line 3\n")
@@ -109,9 +109,9 @@ async def test_remote_lock_serializes_access(tmp_path):
 
     async def writer2():
         await started.wait()
-        async with lk2.owned_local_copy("c.txt") as p:
+        async with lk2.owned_local_copy("c.txt") as handle:
             # Append lines
-            with open(p, "a") as f:
+            with open(handle.path, "a") as f:
                 f.write("two line 1\n")
                 f.write("two line 2\n")
                 f.write("two line 3\n")
@@ -122,8 +122,8 @@ async def test_remote_lock_serializes_access(tmp_path):
     # Check the final blob content
     assert bucket.blob("c.txt").exists()
     # Read back through readonly path
-    async with lk1.readonly_local_copy("c.txt") as p:
-        content = p.read_text()
+    async with lk1.readonly_local_copy("c.txt") as handle:
+        content = handle.path.read_text()
         # The content should have both sets of changes in order
         expected = "x" + "one line 1\none line 2\none line 3\n" + "two line 1\ntwo line 2\ntwo line 3\n"
         assert content == expected
@@ -138,13 +138,13 @@ async def test_owned_context_exception_still_uploads_and_releases_lock(tmp_path)
 
     # cause an exception after modifying local copy
     with pytest.raises(RuntimeError, match="boom"):
-        async with lk.owned_local_copy("x.txt") as p:
-            p.write_text("v2")
+        async with lk.owned_local_copy("x.txt") as handle:
+            handle.path.write_text("v2")
             raise RuntimeError("boom")
 
     # change should still be uploaded
-    async with lk.readonly_local_copy("x.txt") as p2:
-        assert p2.read_text() == "v2"
+    async with lk.readonly_local_copy("x.txt") as handle2:
+        assert handle2.path.read_text() == "v2"
 
     # remote lock should be gone (no deadlock)
     assert not bucket.blob("locks/x.txt.lock").exists()
@@ -156,13 +156,13 @@ async def test_owned_context_exception_without_change_skips_upload_and_releases_
     lk = Locker("dummy", tmp_path, bucket=bucket)
 
     with pytest.raises(ValueError):
-        async with lk.owned_local_copy("y.txt") as p:
-            _ = p.read_text()  # no modification
+        async with lk.owned_local_copy("y.txt") as handle:
+            _ = handle.path.read_text()  # no modification
             raise ValueError("oops")
 
     # content unchanged
-    async with lk.readonly_local_copy("y.txt") as p2:
-        assert p2.read_text() == "v1"
+    async with lk.readonly_local_copy("y.txt") as handle2:
+        assert handle2.path.read_text() == "v1"
 
     # lock released
     assert not bucket.blob("locks/y.txt.lock").exists()
@@ -176,16 +176,16 @@ async def test_no_deadlock_after_exception(tmp_path):
 
     # First context raises
     with pytest.raises(RuntimeError):
-        async with lk1.owned_local_copy("z.txt") as p:
-            p.write_text("mid")
+        async with lk1.owned_local_copy("z.txt") as handle:
+            handle.path.write_text("mid")
             raise RuntimeError("boom")
 
     # Second context should proceed normally
-    async with lk2.owned_local_copy("z.txt") as p2:
-        p2.write_text("final")
+    async with lk2.owned_local_copy("z.txt") as handle2:
+        handle2.path.write_text("final")
 
-    async with lk1.readonly_local_copy("z.txt") as p3:
-        assert p3.read_text() == "final"
+    async with lk1.readonly_local_copy("z.txt") as handle3:
+        assert handle3.path.read_text() == "final"
     assert not bucket.blob("locks/z.txt.lock").exists()
 
 from bucket_locker import BlobNotFound
@@ -200,5 +200,3 @@ async def test_download_failure_releases_lock(tmp_path):
             pass
 
     assert not bucket.blob("locks/missing.txt.lock").exists()
-
-
