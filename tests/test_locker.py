@@ -1,6 +1,6 @@
 import asyncio
 import pytest
-from bucket_locker import Locker, BlobNotFound, Handle
+from bucket_locker import Locker, BlobNotFound, BlobExists
 from ._fakes import FakeBucket
 
 @pytest.mark.asyncio
@@ -188,8 +188,6 @@ async def test_no_deadlock_after_exception(tmp_path):
         assert handle3.path.read_text() == "final"
     assert not bucket.blob("locks/z.txt.lock").exists()
 
-from bucket_locker import BlobNotFound
-
 @pytest.mark.asyncio
 async def test_download_failure_releases_lock(tmp_path):
     bucket = FakeBucket()  # empty; blob missing
@@ -200,3 +198,41 @@ async def test_download_failure_releases_lock(tmp_path):
             pass
 
     assert not bucket.blob("locks/missing.txt.lock").exists()
+
+@pytest.mark.asyncio
+async def test_new_success(tmp_path):
+    bucket = FakeBucket()
+    lk = Locker("dummy", tmp_path, bucket=bucket)
+
+    async with lk.new("fresh.txt") as p:
+        p.write_text("hello")
+
+    # Uploaded to GCS
+    b = bucket.blob("fresh.txt")
+    assert b.exists()
+    tmp = tmp_path / "dl"
+    b.download_to_filename(tmp)
+    assert tmp.read_text() == "hello"
+
+@pytest.mark.asyncio
+async def test_new_conflicts_if_remote_already_exists(tmp_path):
+    bucket = FakeBucket()
+    bucket.blob("exists.txt").upload_from_string("old")
+    lk = Locker("dummy", tmp_path, bucket=bucket)
+
+    with pytest.raises(BlobExists):
+        async with lk.new("exists.txt") as p:
+            p.write_text("new")
+
+@pytest.mark.asyncio
+async def test_new_no_upload_on_exception(tmp_path):
+    bucket = FakeBucket()
+    lk = Locker("dummy", tmp_path, bucket=bucket)
+
+    with pytest.raises(RuntimeError):
+        async with lk.new("draft.bin") as p:
+            p.write_bytes(b"partial")
+            raise RuntimeError("boom")
+
+    # Nothing uploaded
+    assert not bucket.blob("draft.bin").exists()

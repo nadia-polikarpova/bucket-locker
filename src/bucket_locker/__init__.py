@@ -8,6 +8,6 @@ except Exception:
     __version__ = "0.0.0"  # fallback for editable/dev checkouts
 
 # Public API
-from .bucket_locker import Locker, BlobNotFound, Handle
+from .bucket_locker import Locker, BlobNotFound, BlobExists, Handle
 
-__all__ = ["Locker", "Handle", "BlobNotFound", "__version__"]
+__all__ = ["Locker", "Handle", "BlobNotFound", "BlobExists", "__version__"]
