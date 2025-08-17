@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bucket_locker"
-version = "1.0.0"
+version = "1.0.1"
 description = "A Python library that synchronizes local files with Google Cloud Storage in a concurrency-aware manner."
 readme = "README.md"
 authors = [
