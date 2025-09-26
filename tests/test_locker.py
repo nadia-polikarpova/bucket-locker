@@ -236,3 +236,77 @@ async def test_new_no_upload_on_exception(tmp_path):
 
     # Nothing uploaded
     assert not bucket.blob("draft.bin").exists()
+
+@pytest.mark.asyncio
+async def test_allow_missing_with_file_creation(tmp_path):
+    """Test allow_missing=True when client creates the missing file."""
+    bucket = FakeBucket()
+    lk = Locker("dummy", tmp_path, bucket=bucket)
+
+    # Blob doesn't exist in GCS initially
+    assert not bucket.blob("new_file.txt").exists()
+
+    async with lk.owned_local_copy("new_file.txt", allow_missing=True) as handle:
+        # Client creates the file
+        handle.path.write_text("created by client")
+
+    # File should now exist in GCS after upload
+    assert bucket.blob("new_file.txt").exists()
+
+    # Verify the content was uploaded correctly
+    tmp = tmp_path / "download_test"
+    bucket.blob("new_file.txt").download_to_filename(tmp)
+    assert tmp.read_text() == "created by client"
+
+@pytest.mark.asyncio
+async def test_allow_missing_without_file_creation(tmp_path):
+    """Test allow_missing=True when client doesn't create the missing file."""
+    bucket = FakeBucket()
+    lk = Locker("dummy", tmp_path, bucket=bucket)
+
+    # Blob doesn't exist in GCS initially
+    assert not bucket.blob("missing_file.txt").exists()
+
+    # This should not raise an exception even though the file doesn't exist
+    # and the client doesn't create it
+    async with lk.owned_local_copy("missing_file.txt", allow_missing=True) as handle:
+        # Client doesn't create the file - just verify path exists but file doesn't
+        assert not handle.path.exists()
+
+    # File should still not exist in GCS
+    assert not bucket.blob("missing_file.txt").exists()
+
+@pytest.mark.asyncio
+async def test_allow_missing_false_still_raises_for_missing_files(tmp_path):
+    """Test that allow_missing=False (default) still raises BlobNotFound for missing files."""
+    bucket = FakeBucket()
+    lk = Locker("dummy", tmp_path, bucket=bucket)
+
+    # Blob doesn't exist in GCS
+    assert not bucket.blob("definitely_missing.txt").exists()
+
+    # Should raise BlobNotFound with default allow_missing=False
+    with pytest.raises(BlobNotFound):
+        async with lk.owned_local_copy("definitely_missing.txt") as handle:
+            handle.path.write_text("this won't work")
+
+@pytest.mark.asyncio
+async def test_allow_missing_with_existing_file_behaves_normally(tmp_path):
+    """Test that allow_missing=True doesn't affect behavior for existing files."""
+    bucket = FakeBucket()
+    bucket.blob("existing.txt").upload_from_string("original content")
+    lk = Locker("dummy", tmp_path, bucket=bucket)
+
+    # File exists in GCS
+    assert bucket.blob("existing.txt").exists()
+
+    async with lk.owned_local_copy("existing.txt", allow_missing=True) as handle:
+        # Should download the existing file
+        assert handle.path.read_text() == "original content"
+        # Client modifies it
+        handle.path.write_text("modified content")
+
+    # Should upload the modified content
+    tmp = tmp_path / "verify_upload"
+    bucket.blob("existing.txt").download_to_filename(tmp)
+    assert tmp.read_text() == "modified content"

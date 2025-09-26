@@ -54,12 +54,16 @@ class Locker:
         return p
 
     @asynccontextmanager
-    async def owned_local_copy(self, blob_name: str) -> AsyncIterator[Handle]:
+    async def owned_local_copy(self, blob_name: str, *, allow_missing: bool = False) -> AsyncIterator[Handle]:
         """
             Context manager for safe read-write access to a blob via a local copy.
             It will download the blob if local copy is out of sync and upload it upon exiting the context if the content has changed.
             The local file will be locked for the duration of the context to prevent concurrent access.
-            Will raise BlobNotFoundError if the blob does not exist in GCS.
+            Will raise BlobNotFoundError if the blob does not exist in GCS, unless allow_missing=True.
+
+            Args:
+                blob_name: Name of the blob in GCS
+                allow_missing: If True, will not raise an exception for missing blobs.
         """
         local_path = self.local_path(blob_name)
         # Acquire local copy lock to prevent concurrent access on the same local copy
@@ -68,7 +72,7 @@ class Locker:
             await self._acquire_blob_lock(blob_name)
             try:
                 # Ensure the session file is available locally
-                await self._download_blob(blob_name)
+                await self._download_blob(blob_name, allow_missing=allow_missing)
                 try:
                     # Create a Handle and yield it to the caller
                     handle = Handle(local_path, self, blob_name)
@@ -76,7 +80,7 @@ class Locker:
                 finally:
                     # Once the caller is done, upload the file even if the caller raised an exception
                     # (but not if download failed!)
-                    await self._upload_blob(blob_name)
+                    await self._upload_blob(blob_name, allow_missing=allow_missing)
             finally:
                 # Release the blob lock in GCS even if download failed or caller raised an exception
                 await self._release_blob_lock(blob_name)
@@ -130,11 +134,15 @@ class Locker:
                 self.logger.error(f"[{PROCESS_ID}] Blob {blob_name} already exists in GCS.")
                 raise BlobExists(blob_name)
 
-    async def _download_blob(self, blob_name: str):
+    async def _download_blob(self, blob_name: str, allow_missing: bool = False):
         """
             Ensure the file is available locally; download from GCS if needed.
-            Raise BlobNotFoundError if the blob does not exist in GCS.
+            Raise BlobNotFoundError if the blob does not exist in GCS, unless allow_missing=True.
             This function is not thread-safe: client must lock the local file before calling it.
+
+            Args:
+                blob_name: Name of the blob in GCS
+                allow_missing: If True, will not raise an exception for missing blobs
         """
         local_path = self.local_path(blob_name)
         if await self._local_in_sync(blob_name):
@@ -147,14 +155,18 @@ class Locker:
                 await self._io(blob.download_to_filename, local_path)
                 await self._save_generation(blob_name, blob)
                 self.logger.info(f"[{PROCESS_ID}] Downloaded blob {blob_name} to {local_path}")
-            else:
+            elif not allow_missing:
                 self.logger.error(f"[{PROCESS_ID}] Blob {blob_name} does not exist in GCS.")
                 raise BlobNotFound(blob_name)
 
-    async def _upload_blob(self, blob_name: str):
+    async def _upload_blob(self, blob_name: str, allow_missing: bool = False):
         """
             Upload the blob back to GCS if it has been modified.
             This function is not thread-safe: client must lock the blob file before calling it.
+
+            Args:
+                blob_name: Name of the blob in GCS
+                allow_missing: If True, will not log an error for missing local files
         """
         local_path = self.local_path(blob_name)
         if local_path.exists():
@@ -175,7 +187,7 @@ class Locker:
                 self.logger.info(f"[{PROCESS_ID}] Uploaded blob {blob_name} to GCS")
             else:
                 self.logger.debug(f"[{PROCESS_ID}] Blob {blob_name} is up-to-date, no upload needed")
-        else:
+        elif not allow_missing:
             self.logger.error(f"[{PROCESS_ID}] Tried to upload non-existent local blob file {local_path}.")
 
     async def _acquire_blob_lock(self,
