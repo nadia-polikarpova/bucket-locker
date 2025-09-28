@@ -68,10 +68,10 @@ class Locker:
         local_path = self.local_path(blob_name)
         # Acquire local copy lock to prevent concurrent access on the same local copy
         async with self._local_lock(blob_name):
-            # Acquire a lock on the session blob in GCS to prevent concurrent access on different local copies
+            # Acquire a lock on the blob in GCS to prevent concurrent access on different local copies
             await self._acquire_blob_lock(blob_name)
             try:
-                # Ensure the session file is available locally
+                # Ensure the file is available locally
                 await self._download_blob(blob_name, allow_missing=allow_missing)
                 try:
                     # Create a Handle and yield it to the caller
@@ -80,7 +80,7 @@ class Locker:
                 finally:
                     # Once the caller is done, upload the file even if the caller raised an exception
                     # (but not if download failed!)
-                    await self._upload_blob(blob_name, allow_missing=allow_missing)
+                    await self._upload_blob(blob_name)
             finally:
                 # Release the blob lock in GCS even if download failed or caller raised an exception
                 await self._release_blob_lock(blob_name)
@@ -155,40 +155,68 @@ class Locker:
                 await self._io(blob.download_to_filename, local_path)
                 await self._save_generation(blob_name, blob)
                 self.logger.info(f"[{PROCESS_ID}] Downloaded blob {blob_name} to {local_path}")
-            elif not allow_missing:
+            elif allow_missing:
+                # Save generation as 0 because we need to remember than the blob had not existed at download time
+                self._save_generation_0(blob_name)
+            else:
                 self.logger.error(f"[{PROCESS_ID}] Blob {blob_name} does not exist in GCS.")
                 raise BlobNotFound(blob_name)
 
-    async def _upload_blob(self, blob_name: str, allow_missing: bool = False):
+    async def _upload_blob(self, blob_name: str):
         """
             Upload the blob back to GCS if it has been modified.
             This function is not thread-safe: client must lock the blob file before calling it.
 
             Args:
                 blob_name: Name of the blob in GCS
-                allow_missing: If True, will not log an error for missing local files
+                allow_missing: If True, needs to handle missing blobs and local files.
         """
         local_path = self.local_path(blob_name)
-        if local_path.exists():
-            blob = self._bucket.blob(blob_name)
-            await self._io(blob.reload)  # Ensure we have the latest generation info
-            if await self._io(self._files_differ_crc32c, local_path, blob):
-                try:
-                    local_gen = self._local_generation(blob_name) # Generation at the time of download
-                    await self._io(blob.upload_from_filename, local_path, if_generation_match=local_gen)
-                except PreconditionFailed:
-                    # Someone has modified the blob since we downloaded it despite our lock!
-                    # We're going to upload to a new unique blob name to avoid overwriting.
-                    new_blob_name = f"{blob_name}.conflict.{uuid.uuid4()}"
-                    self.logger.error(f"[{PROCESS_ID}] Blob {blob_name} was modified in an unprotected manner. Uploading to {new_blob_name} instead.")
-                    blob = self._bucket.blob(new_blob_name)
-                    await self._io(blob.upload_from_filename, local_path, if_generation_match=0)  # 0 means 'create new'
-                await self._save_generation(blob_name, blob) # In case of conflict, save under original name by design, because we want to re-download the blob next time
+        local_gen = self._local_generation(blob_name) # Generation at the time of download
+        # local_gen cannot be None because it is always set to a value (real gen or 0) by _download_blob
+        assert local_gen is not None
+
+        self.logger.info(f"[{PROCESS_ID}] Preparing to upload blob {blob_name} from {local_path} (local_gen={local_gen})")
+
+        if not local_path.exists():
+            if local_gen != 0:
+                # The local file is missing but the blob existed at download time
+                self.logger.error(f"[{PROCESS_ID}] Tried to upload non-existent local blob file {local_path}.")
+            # If the blob did not exist at download time (local_gen == 0) and the local file is missing, nothing to do;
+            # but in any case, return
+            return
+
+        blob = self._bucket.blob(blob_name)
+        # If the blob exists, reload to get the latest generation info before comparing
+        blob_exists = await self._io(blob.exists)
+        if blob_exists:
+            await self._io(blob.reload)
+
+        self.logger.info(f"[{PROCESS_ID}] Blob {blob_name} exists in GCS: {blob_exists}, remote gen={blob.generation if blob_exists else 'N/A'}, local gen={local_gen}")
+
+        if await self._io(self._files_differ_crc32c, local_path, blob):
+            # files differ (or remote does not exist) - upload and handle conflicts
+            try:
+                self.logger.info(f"[{PROCESS_ID}] Files differ, uploading blob {blob_name} to GCS from {local_path}")
+                await self._io(blob.upload_from_filename, local_path, if_generation_match=local_gen)
+                await self._save_generation(blob_name, blob)
                 self.logger.info(f"[{PROCESS_ID}] Uploaded blob {blob_name} to GCS")
-            else:
-                self.logger.debug(f"[{PROCESS_ID}] Blob {blob_name} is up-to-date, no upload needed")
-        elif not allow_missing:
-            self.logger.error(f"[{PROCESS_ID}] Tried to upload non-existent local blob file {local_path}.")
+            except PreconditionFailed:
+                self.logger.error(f"[{PROCESS_ID}] Conflict detected while uploading blob {blob_name} from {local_path}")
+                await self.handle_conflict(blob_name, local_path)
+                # In case of conflict we do not update the local generation to force a re-download next time
+        else:
+            self.logger.debug(f"[{PROCESS_ID}] Blob {blob_name} is up-to-date, no upload needed")
+
+    async def handle_conflict(self, blob_name: str, local_path: Path):
+        """
+            If a blob has been modified in an unprotected manner,
+            handle a conflict by uploading the local file to a new unique blob name.
+        """
+        new_blob_name = f"{blob_name}.conflict.{uuid.uuid4()}"
+        self.logger.error(f"[{PROCESS_ID}] Blob {blob_name} was modified in an unprotected manner. Uploading to {new_blob_name} instead.")
+        blob = self._bucket.blob(new_blob_name)
+        await self._io(blob.upload_from_filename, local_path, if_generation_match=0)  # 0 means 'create new'
 
     async def _acquire_blob_lock(self,
                                 blob_name: str,
@@ -264,6 +292,13 @@ class Locker:
         await self._io(blob.reload)
         with open(self._meta_path(blob_name), 'w') as f:
             f.write(str(blob.generation))
+
+    def _save_generation_0(self, blob_name: str):
+        """
+            Save generation to be 0 (blob does not exist)
+        """
+        with open(self._meta_path(blob_name), 'w') as f:
+            f.write("0")
 
     def _crc32c_of_file(self, path: Path) -> bytes:
         """Calculate the CRC32C checksum of a file."""

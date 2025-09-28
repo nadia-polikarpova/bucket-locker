@@ -19,8 +19,8 @@ class FakeBlob:
         return self.name in self._store
 
     def reload(self) -> None:
-        # no-op in fake; attributes come from store
-        pass
+        if not self.exists():
+            raise Exception("NotFound")
 
     @property
     def generation(self) -> int:
@@ -69,13 +69,9 @@ class FakeBlob:
             f.write(self._store[self.name]["bytes"])
 
     def delete(self, *, if_generation_match: Optional[int] = None) -> None:
-        # Only delete if precondition passes (if provided)
-        if if_generation_match is not None:
-            if not self.exists() or int(self.generation) != int(if_generation_match):
-                raise PreconditionFailed(
-                    f"delete if_generation_match={if_generation_match} but current gen={self.generation}"
-                )
-        # Best-effort delete (no NotFound)
+        if not self.exists():
+            raise Exception("NotFound")
+        self._enforce_if_generation_match(if_generation_match)
         self._store.pop(self.name, None)
 
 class FakeBucket:

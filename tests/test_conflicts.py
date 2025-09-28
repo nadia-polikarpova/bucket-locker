@@ -1,5 +1,4 @@
 import re
-from pathlib import Path
 import pytest
 
 from bucket_locker import Locker
