@@ -176,8 +176,6 @@ class Locker:
         # local_gen cannot be None because it is always set to a value (real gen or 0) by _download_blob
         assert local_gen is not None
 
-        self.logger.info(f"[{PROCESS_ID}] Preparing to upload blob {blob_name} from {local_path} (local_gen={local_gen})")
-
         if not local_path.exists():
             if local_gen != 0:
                 # The local file is missing but the blob existed at download time
@@ -192,12 +190,9 @@ class Locker:
         if blob_exists:
             await self._io(blob.reload)
 
-        self.logger.info(f"[{PROCESS_ID}] Blob {blob_name} exists in GCS: {blob_exists}, remote gen={blob.generation if blob_exists else 'N/A'}, local gen={local_gen}")
-
         if await self._io(self._files_differ_crc32c, local_path, blob):
             # files differ (or remote does not exist) - upload and handle conflicts
             try:
-                self.logger.info(f"[{PROCESS_ID}] Files differ, uploading blob {blob_name} to GCS from {local_path}")
                 await self._io(blob.upload_from_filename, local_path, if_generation_match=local_gen)
                 await self._save_generation(blob_name, blob)
                 self.logger.info(f"[{PROCESS_ID}] Uploaded blob {blob_name} to GCS")
