@@ -1,7 +1,6 @@
 from dataclasses import dataclass
 from collections import defaultdict
 from contextlib import asynccontextmanager
-import logging
 import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,6 +10,8 @@ import base64
 from google.cloud import storage
 from google.api_core.exceptions import PreconditionFailed
 import google_crc32c
+import logging
+logger = logging.getLogger(__name__)
 
 PROCESS_ID = str(uuid.uuid4())
 
@@ -42,8 +43,6 @@ class Locker:
         self._client = storage.Client()
         self._bucket = bucket or self._client.bucket(bucket_name)
         self._file_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
-        self.logger = logging.getLogger(__name__)
-        self.logger.setLevel(logging.INFO)
 
     def local_path(self, blob_name: str) -> Path:
         """Path to the local copy of a blob."""
@@ -118,21 +117,21 @@ class Locker:
             # Create parent directory if it does not exist
             local_path.parent.mkdir(parents=True, exist_ok=True)
             if local_path.exists():
-                self.logger.error(f"[{PROCESS_ID}] Tried to create blob, but local copy {local_path} already exists.")
+                logger.error(f"[{PROCESS_ID}] Tried to create blob, but local copy {local_path} already exists.")
                 raise FileExistsError(f"Local file {local_path} already exists.")
             yield local_path  # Yield the local path to the caller
             if not local_path.exists():
-                self.logger.error(f"[{PROCESS_ID}] Tried to upload non-existent local blob file {local_path}.")
+                logger.error(f"[{PROCESS_ID}] Tried to upload non-existent local blob file {local_path}.")
                 raise FileNotFoundError(f"Local file {local_path} does not exist after creation.")
             # Upload the blob to GCS
             blob = self._bucket.blob(blob_name)
             try:
                 await self._io(blob.upload_from_filename, local_path, if_generation_match=0)  # 0 means 'create new'
                 await self._save_generation(blob_name, blob)  # Save the generation number
-                self.logger.info(f"[{PROCESS_ID}] Created new blob {blob_name} in GCS from {local_path}")
+                logger.info(f"[{PROCESS_ID}] Created new blob {blob_name} in GCS from {local_path}")
             except PreconditionFailed:
                 # Blob already exists, raise an error
-                self.logger.error(f"[{PROCESS_ID}] Blob {blob_name} already exists in GCS.")
+                logger.error(f"[{PROCESS_ID}] Blob {blob_name} already exists in GCS.")
                 raise BlobExists(blob_name)
 
     async def _download_blob(self, blob_name: str, allow_missing: bool = False):
@@ -148,23 +147,23 @@ class Locker:
         local_path = self.local_path(blob_name)
         if await self._local_in_sync(blob_name):
             # Local copy is up-to-date, no need to download
-            self.logger.debug(f"[{PROCESS_ID}] Blob {blob_name} is up-to-date, no download needed")
+            logger.debug(f"[{PROCESS_ID}] Blob {blob_name} is up-to-date, no download needed")
         else:
             local_path.parent.mkdir(parents=True, exist_ok=True)
             blob = self._bucket.blob(blob_name)
             if await self._io(blob.exists):
                 await self._io(blob.download_to_filename, local_path)
                 await self._save_generation(blob_name, blob)
-                self.logger.info(f"[{PROCESS_ID}] Downloaded blob {blob_name} to {local_path}")
+                logger.info(f"[{PROCESS_ID}] Downloaded blob {blob_name} to {local_path}")
             elif allow_missing:
                 # If a local copy exists, delete it
                 if local_path.exists():
                     await self._io(local_path.unlink)
-                    self.logger.info(f"[{PROCESS_ID}] Downloaded missing blob {blob_name} by deleting the local copy {local_path}")
+                    logger.info(f"[{PROCESS_ID}] Downloaded missing blob {blob_name} by deleting the local copy {local_path}")
                 # Save generation as 0 because we need to remember than the blob had not existed at download time
                 self._save_generation_0(blob_name)
             else:
-                self.logger.error(f"[{PROCESS_ID}] Blob {blob_name} does not exist in GCS.")
+                logger.error(f"[{PROCESS_ID}] Blob {blob_name} does not exist in GCS.")
                 raise BlobNotFound(blob_name)
 
     async def _upload_blob(self, blob_name: str):
@@ -184,7 +183,7 @@ class Locker:
         if not local_path.exists():
             if local_gen != 0:
                 # The local file is missing but the blob existed at download time
-                self.logger.error(f"[{PROCESS_ID}] Tried to upload non-existent local blob file {local_path}.")
+                logger.error(f"[{PROCESS_ID}] Tried to upload non-existent local blob file {local_path}.")
             # If the blob did not exist at download time (local_gen == 0) and the local file is missing, nothing to do;
             # but in any case, return
             return
@@ -200,13 +199,13 @@ class Locker:
             try:
                 await self._io(blob.upload_from_filename, local_path, if_generation_match=local_gen)
                 await self._save_generation(blob_name, blob)
-                self.logger.info(f"[{PROCESS_ID}] Uploaded blob {blob_name} to GCS")
+                logger.info(f"[{PROCESS_ID}] Uploaded blob {blob_name} to GCS")
             except PreconditionFailed:
-                self.logger.error(f"[{PROCESS_ID}] Conflict detected while uploading blob {blob_name} from {local_path}")
+                logger.error(f"[{PROCESS_ID}] Conflict detected while uploading blob {blob_name} from {local_path}")
                 await self.handle_conflict(blob_name, local_path)
                 # In case of conflict we do not update the local generation to force a re-download next time
         else:
-            self.logger.debug(f"[{PROCESS_ID}] Blob {blob_name} is up-to-date, no upload needed")
+            logger.debug(f"[{PROCESS_ID}] Blob {blob_name} is up-to-date, no upload needed")
 
     async def handle_conflict(self, blob_name: str, local_path: Path):
         """
@@ -214,7 +213,7 @@ class Locker:
             handle a conflict by uploading the local file to a new unique blob name.
         """
         new_blob_name = f"{blob_name}.conflict.{uuid.uuid4()}"
-        self.logger.error(f"[{PROCESS_ID}] Blob {blob_name} was modified in an unprotected manner. Uploading to {new_blob_name} instead.")
+        logger.error(f"[{PROCESS_ID}] Blob {blob_name} was modified in an unprotected manner. Uploading to {new_blob_name} instead.")
         blob = self._bucket.blob(new_blob_name)
         await self._io(blob.upload_from_filename, local_path, if_generation_match=0)  # 0 means 'create new'
 
@@ -235,7 +234,7 @@ class Locker:
                 await self._io(blob.upload_from_string, content, if_generation_match=0)
                 return  # acquired
             except PreconditionFailed:
-                self.logger.info(f"[{PROCESS_ID}] Waiting for blob lock on {blob_name}...")
+                logger.info(f"[{PROCESS_ID}] Waiting for blob lock on {blob_name}...")
                 await asyncio.sleep(delay)  # non-blocking wait
             except Exception as e:
                 raise RuntimeError(f"Unexpected error acquiring lock: {e}")
@@ -251,7 +250,7 @@ class Locker:
         try:
             await self._io(blob.delete)
         except Exception as e:
-            self.logger.error(f"[{PROCESS_ID}] Failed to delete lock for {blob_name}: {e}")
+            logger.error(f"[{PROCESS_ID}] Failed to delete lock for {blob_name}: {e}")
 
     def _local_lock(self, blob_name: str) -> asyncio.Lock:
         """
