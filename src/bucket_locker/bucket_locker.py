@@ -63,7 +63,8 @@ class Locker:
 
             Args:
                 blob_name: Name of the blob in GCS
-                allow_missing: If True, will not raise an exception for missing blobs.
+                allow_missing: If False, will raise BlobNotFoundError if the blob does not exist in GCS.
+                               If True, getting an owned copy of a missing blob will delete any existing local copy.
         """
         local_path = self.local_path(blob_name)
         # Acquire local copy lock to prevent concurrent access on the same local copy
@@ -136,13 +137,13 @@ class Locker:
 
     async def _download_blob(self, blob_name: str, allow_missing: bool = False):
         """
-            Ensure the file is available locally; download from GCS if needed.
-            Raise BlobNotFoundError if the blob does not exist in GCS, unless allow_missing=True.
+            Ensure that the local file is in sync with the blob in GCS.
             This function is not thread-safe: client must lock the local file before calling it.
 
             Args:
                 blob_name: Name of the blob in GCS
-                allow_missing: If True, will not raise an exception for missing blobs
+                allow_missing: If False, will raise BlobNotFoundError if the blob does not exist in GCS.
+                               If True, "downloading" a missing blob means deleting the local copy if it exists.
         """
         local_path = self.local_path(blob_name)
         if await self._local_in_sync(blob_name):
@@ -156,6 +157,10 @@ class Locker:
                 await self._save_generation(blob_name, blob)
                 self.logger.info(f"[{PROCESS_ID}] Downloaded blob {blob_name} to {local_path}")
             elif allow_missing:
+                # If a local copy exists, delete it
+                if local_path.exists():
+                    await self._io(local_path.unlink)
+                    self.logger.info(f"[{PROCESS_ID}] Downloaded missing blob {blob_name} by deleting the local copy {local_path}")
                 # Save generation as 0 because we need to remember than the blob had not existed at download time
                 self._save_generation_0(blob_name)
             else:
@@ -263,13 +268,15 @@ class Locker:
         return f"locks/{blob_name}.lock"
 
     async def _local_in_sync(self, blob_name: str) -> bool:
-        """Check if the local copy of the blob is still in sync with GCS."""
+        """Check if the local copy of the blob is in sync with GCS."""
         local_gen = self._local_generation(blob_name)
         if local_gen is None:
-            return False
+            return False # No local generation info: not in sync
         blob = self._bucket.blob(blob_name)
-        await self._io(blob.reload)
-        return blob.generation == local_gen
+        if await self._io(blob.exists):
+            await self._io(blob.reload)
+            return blob.generation == local_gen
+        return False # Local copy exists but remote blob does not: not in sync
 
     def _local_generation(self, blob_name: str) -> Optional[int]:
         """Get the local generation number of the blob."""
