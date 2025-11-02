@@ -271,6 +271,11 @@ class Locker:
         local_gen = self._local_generation(blob_name)
         if local_gen is None:
             return False # No local generation info: not in sync
+        local_path = self.local_path(blob_name)
+        if not local_path.exists():
+            # This should not happen under normal operation,
+            # but someone could have deleted the local file out of band
+            return False
         blob = self._bucket.blob(blob_name)
         if await self._io(blob.exists):
             await self._io(blob.reload)
