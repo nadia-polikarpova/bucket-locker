@@ -183,9 +183,17 @@ class Locker:
         if not local_path.exists():
             if local_gen != 0:
                 # The local file is missing but the blob existed at download time
-                logger.error(f"[{PROCESS_ID}] Tried to upload non-existent local blob file {local_path}.")
-            # If the blob did not exist at download time (local_gen == 0) and the local file is missing, nothing to do;
-            # but in any case, return
+                # Delete the remote blob to keep in sync
+                blob = self._bucket.blob(blob_name)
+                try:
+                    await self._io(blob.delete, if_generation_match=local_gen)
+                    self._save_generation_0(blob_name)
+                    logger.info(f"[{PROCESS_ID}] Deleted remote blob {blob_name} because local file was deleted")
+                except PreconditionFailed:
+                    # Blob was modified remotely since download - this is a conflict
+                    logger.error(f"[{PROCESS_ID}] Conflict detected while trying to delete blob {blob_name}")
+                    # We don't update the generation, forcing a re-download next time
+            # If the blob did not exist at download time (local_gen == 0) and the local file is missing, nothing to do
             return
 
         blob = self._bucket.blob(blob_name)

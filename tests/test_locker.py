@@ -310,3 +310,35 @@ async def test_allow_missing_with_existing_file_behaves_normally(tmp_path):
     tmp = tmp_path / "verify_upload"
     bucket.blob("existing.txt").download_to_filename(tmp)
     assert tmp.read_text() == "modified content"
+
+@pytest.mark.asyncio
+async def test_delete_local_file_deletes_remote_blob(tmp_path):
+    """Test that deleting a local file also deletes the remote blob."""
+    bucket = FakeBucket()
+    bucket.blob("to_delete.txt").upload_from_string("will be deleted")
+    lk = Locker("dummy", tmp_path, bucket=bucket)
+
+    # Remote blob exists
+    assert bucket.blob("to_delete.txt").exists()
+
+    async with lk.owned_local_copy("to_delete.txt") as handle:
+        # Delete the local file
+        handle.path.unlink()
+
+    # Remote blob should also be deleted
+    assert not bucket.blob("to_delete.txt").exists()
+
+@pytest.mark.asyncio
+async def test_delete_local_file_no_upload_when_blob_never_existed(tmp_path):
+    """Test that deleting a local file that was created for a missing blob does nothing."""
+    bucket = FakeBucket()
+    lk = Locker("dummy", tmp_path, bucket=bucket)
+
+    # Blob doesn't exist, create local file with allow_missing
+    async with lk.owned_local_copy("never_existed.txt", allow_missing=True) as handle:
+        # Create and then delete the local file
+        handle.path.write_text("temporary")
+        handle.path.unlink()
+
+    # Remote blob should still not exist
+    assert not bucket.blob("never_existed.txt").exists()

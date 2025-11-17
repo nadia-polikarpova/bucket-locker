@@ -84,3 +84,23 @@ async def test_no_conflict_when_remote_changes_metadata_only_crc_equal(tmp_path)
 
     # And local_in_sync should say 'up-to-date' only if you saved the new gen on skip;
     # if not, it should force a re-download next time. Either is acceptable by policy.
+
+@pytest.mark.asyncio
+async def test_delete_local_file_conflict_when_remote_changed(tmp_path):
+    """Test that deleting a local file when remote changed results in a conflict."""
+    bucket = FakeBucket()
+    bucket.blob("conflict_delete.txt").upload_from_string("v1")
+    lk = Locker("dummy", tmp_path, bucket=bucket)
+
+    async with lk.owned_local_copy("conflict_delete.txt") as handle:
+        # Delete the local file
+        handle.path.unlink()
+        # Someone else modifies the remote blob
+        bucket.blob("conflict_delete.txt").upload_from_string("v2")
+
+    # Remote blob should still exist (conflict prevented deletion)
+    assert bucket.blob("conflict_delete.txt").exists()
+    # Content should be v2 (the remote change)
+    tmp = tmp_path / "verify"
+    bucket.blob("conflict_delete.txt").download_to_filename(tmp)
+    assert tmp.read_text() == "v2"
