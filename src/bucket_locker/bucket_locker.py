@@ -53,7 +53,7 @@ class Locker:
         return p
 
     @asynccontextmanager
-    async def owned_local_copy(self, blob_name: str, *, allow_missing: bool = False) -> AsyncIterator[Handle]:
+    async def owned_local_copy(self, blob_name: str, *, allow_missing: bool = False, verify_checksum: bool = False) -> AsyncIterator[Handle]:
         """
             Context manager for safe read-write access to a blob via a local copy.
             It will download the blob if local copy is out of sync and upload it upon exiting the context if the content has changed.
@@ -64,6 +64,8 @@ class Locker:
                 blob_name: Name of the blob in GCS
                 allow_missing: If False, will raise BlobNotFoundError if the blob does not exist in GCS.
                                If True, getting an owned copy of a missing blob will delete any existing local copy.
+                verify_checksum: If True, also verify that the local file's checksum matches the remote blob's checksum.
+                                 This catches local modifications made out-of-band since the last download.
         """
         local_path = self.local_path(blob_name)
         # Acquire local copy lock to prevent concurrent access on the same local copy
@@ -72,7 +74,7 @@ class Locker:
             await self._acquire_blob_lock(blob_name)
             try:
                 # Ensure the file is available locally
-                await self._download_blob(blob_name, allow_missing=allow_missing)
+                await self._download_blob(blob_name, allow_missing=allow_missing, verify_checksum=verify_checksum)
                 try:
                     # Create a Handle and yield it to the caller
                     handle = Handle(local_path, self, blob_name)
@@ -86,18 +88,23 @@ class Locker:
                 await self._release_blob_lock(blob_name)
 
     @asynccontextmanager
-    async def readonly_local_copy(self, blob_name: str) -> AsyncIterator[Handle]:
+    async def readonly_local_copy(self, blob_name: str, *, verify_checksum: bool = False) -> AsyncIterator[Handle]:
         """
             Context manager for safe read-only access to a blob via a local copy.
             It will download the blob if local copy is out of sync, but will not lock or upload the blob.
             The local file will be locked for the duration of the context (to prevent reading an incomplete file).
             Will raise BlobNotFoundError if the blob does not exist in GCS.
+
+            Args:
+                blob_name: Name of the blob in GCS
+                verify_checksum: If True, also verify that the local file's checksum matches the remote blob's checksum.
+                                 This catches local modifications made out-of-band since the last download.
         """
         local_path = self.local_path(blob_name)
         # Acquire local copy lock to prevent reading while someone else is writing
         async with self._local_lock(blob_name):
             # Ensure the session file is available locally
-            await self._download_blob(blob_name)
+            await self._download_blob(blob_name, verify_checksum=verify_checksum)
             # Create a Handle and yield it to the caller
             handle = Handle(local_path, self, blob_name)
             yield handle
@@ -134,7 +141,7 @@ class Locker:
                 logger.error(f"[{PROCESS_ID}] Blob {blob_name} already exists in GCS.")
                 raise BlobExists(blob_name)
 
-    async def _download_blob(self, blob_name: str, allow_missing: bool = False):
+    async def _download_blob(self, blob_name: str, allow_missing: bool = False, verify_checksum: bool = False):
         """
             Ensure that the local file is in sync with the blob in GCS.
             This function is not thread-safe: client must lock the local file before calling it.
@@ -143,9 +150,11 @@ class Locker:
                 blob_name: Name of the blob in GCS
                 allow_missing: If False, will raise BlobNotFoundError if the blob does not exist in GCS.
                                If True, "downloading" a missing blob means deleting the local copy if it exists.
+                verify_checksum: If True, also verify that the local file's checksum matches the remote blob's checksum.
+                                 This catches local modifications made out-of-band since the last download.
         """
         local_path = self.local_path(blob_name)
-        if await self._local_in_sync(blob_name):
+        if await self._local_in_sync(blob_name, verify_checksum=verify_checksum):
             # Local copy is up-to-date, no need to download
             logger.debug(f"[{PROCESS_ID}] Blob {blob_name} is up-to-date, no download needed")
         else:
@@ -274,8 +283,14 @@ class Locker:
         """Path to the remote lock blob in GCS."""
         return f"locks/{blob_name}.lock"
 
-    async def _local_in_sync(self, blob_name: str) -> bool:
-        """Check if the local copy of the blob is in sync with GCS."""
+    async def _local_in_sync(self, blob_name: str, verify_checksum: bool = False) -> bool:
+        """Check if the local copy of the blob is in sync with GCS.
+
+        Args:
+            blob_name: Name of the blob in GCS
+            verify_checksum: If True, also verify that the local file's checksum matches the remote blob's checksum.
+                             This catches local modifications made out-of-band since the last download.
+        """
         local_gen = self._local_generation(blob_name)
         if local_gen is None:
             return False # No local generation info: not in sync
@@ -287,7 +302,14 @@ class Locker:
         blob = self._bucket.blob(blob_name)
         if await self._io(blob.exists):
             await self._io(blob.reload)
-            return blob.generation == local_gen
+            if blob.generation != local_gen:
+                return False
+            if verify_checksum:
+                # Generations match, but verify content hasn't been modified locally
+                if await self._io(self._files_differ_crc32c, local_path, blob):
+                    logger.warning(f"[{PROCESS_ID}] Local file {local_path} has been modified out-of-band (checksum mismatch)")
+                    return False
+            return True
         return False # Local copy exists but remote blob does not: not in sync
 
     def _local_generation(self, blob_name: str) -> Optional[int]:

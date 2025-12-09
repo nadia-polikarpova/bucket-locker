@@ -342,3 +342,91 @@ async def test_delete_local_file_no_upload_when_blob_never_existed(tmp_path):
 
     # Remote blob should still not exist
     assert not bucket.blob("never_existed.txt").exists()
+
+
+# --- verify_checksum tests ---
+
+@pytest.mark.asyncio
+async def test_verify_checksum_redownloads_when_local_modified(tmp_path):
+    """Test that verify_checksum=True forces re-download when local file was modified out-of-band."""
+    bucket = FakeBucket()
+    bucket.blob("check.txt").upload_from_string("original")
+    lk = Locker("dummy", tmp_path, bucket=bucket)
+
+    # First, get a local copy to establish generation
+    async with lk.readonly_local_copy("check.txt") as handle:
+        assert handle.path.read_text() == "original"
+
+    # Modify local file out-of-band (simulating corruption or accidental edit)
+    local_path = lk.local_path("check.txt")
+    local_path.write_text("modified out of band")
+
+    # Without verify_checksum, generation matches so no re-download
+    async with lk.readonly_local_copy("check.txt", verify_checksum=False) as handle:
+        assert handle.path.read_text() == "modified out of band"
+
+    # With verify_checksum=True, checksum mismatch forces re-download
+    async with lk.readonly_local_copy("check.txt", verify_checksum=True) as handle:
+        assert handle.path.read_text() == "original"
+
+
+@pytest.mark.asyncio
+async def test_verify_checksum_no_redownload_when_unchanged(tmp_path):
+    """Test that verify_checksum=True doesn't re-download when local file is unchanged."""
+    bucket = FakeBucket()
+    bucket.blob("unchanged.txt").upload_from_string("content")
+    lk = Locker("dummy", tmp_path, bucket=bucket)
+
+    # Get initial copy
+    async with lk.readonly_local_copy("unchanged.txt") as handle:
+        assert handle.path.read_text() == "content"
+
+    # Local file is unchanged, verify_checksum should still pass
+    async with lk.readonly_local_copy("unchanged.txt", verify_checksum=True) as handle:
+        assert handle.path.read_text() == "content"
+
+
+@pytest.mark.asyncio
+async def test_verify_checksum_owned_local_copy(tmp_path):
+    """Test verify_checksum with owned_local_copy."""
+    bucket = FakeBucket()
+    bucket.blob("owned.txt").upload_from_string("remote content")
+    lk = Locker("dummy", tmp_path, bucket=bucket)
+
+    # First, get a local copy
+    async with lk.owned_local_copy("owned.txt") as handle:
+        assert handle.path.read_text() == "remote content"
+
+    # Modify local file out-of-band
+    local_path = lk.local_path("owned.txt")
+    local_path.write_text("tampered")
+
+    # With verify_checksum=True, should re-download and overwrite tampered content
+    async with lk.owned_local_copy("owned.txt", verify_checksum=True) as handle:
+        assert handle.path.read_text() == "remote content"
+        # Now make a legitimate change
+        handle.path.write_text("legitimate update")
+
+    # Verify the legitimate change was uploaded
+    tmp = tmp_path / "verify"
+    bucket.blob("owned.txt").download_to_filename(tmp)
+    assert tmp.read_text() == "legitimate update"
+
+
+@pytest.mark.asyncio
+async def test_verify_checksum_default_false(tmp_path):
+    """Test that verify_checksum defaults to False (backward compatible)."""
+    bucket = FakeBucket()
+    bucket.blob("default.txt").upload_from_string("original")
+    lk = Locker("dummy", tmp_path, bucket=bucket)
+
+    # Get local copy
+    async with lk.readonly_local_copy("default.txt") as handle:
+        pass
+
+    # Modify out-of-band
+    lk.local_path("default.txt").write_text("modified")
+
+    # Default behavior: no checksum verification, so modification persists
+    async with lk.readonly_local_copy("default.txt") as handle:
+        assert handle.path.read_text() == "modified"
